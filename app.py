@@ -1,3 +1,4 @@
+# app.py — 섹션형 Secrets(SCENARIO1/SCENARIO2) 지원 버전
 import os, base64, tempfile
 from pathlib import Path
 import streamlit as st
@@ -19,15 +20,33 @@ _CSV_CANDIDATES = [
 ]
 DEFAULT_CSV = next((p for p in _CSV_CANDIDATES if p.exists()), _CSV_CANDIDATES[0])
 
-PROJECT_ID  = st.secrets.get("PROJECT_ID")
-REGION      = st.secrets.get("REGION", "us-central1")
-ENDPOINT_ID = st.secrets.get("ENDPOINT_ID")
-CREDS_B64   = st.secrets.get("GOOGLE_APPLICATION_CREDENTIALS_B64")
+# ----------------------------
+# Secrets 로더 (섹션형 지원)
+# ----------------------------
+def get_vertex_secrets(section: str | None):
+    """
+    section 이 'SCENARIO1' 또는 'SCENARIO2' 이면 해당 섹션에서 읽고,
+    None 이면 루트 키(뒤호환)에서 읽는다.
+    """
+    if section:
+        sec = st.secrets.get(section, {})
+        project_id  = sec.get("PROJECT_ID")
+        region      = sec.get("REGION", "us-central1")
+        endpoint_id = sec.get("ENDPOINT_ID")
+        creds_b64   = sec.get("GOOGLE_APPLICATION_CREDENTIALS_B64")
+    else:
+        project_id  = st.secrets.get("PROJECT_ID")
+        region      = st.secrets.get("REGION", "us-central1")
+        endpoint_id = st.secrets.get("ENDPOINT_ID")
+        creds_b64   = st.secrets.get("GOOGLE_APPLICATION_CREDENTIALS_B64")
+    return project_id, region, endpoint_id, creds_b64
 
-def _ensure_adc_from_b64():
-    if not CREDS_B64: return None
+def _ensure_adc_from_b64(creds_b64: str | None):
+    """Base64 서비스 계정 JSON을 임시파일로 복원하고 ADC로 등록."""
+    if not creds_b64:
+        return None
     try:
-        raw = base64.b64decode(CREDS_B64)
+        raw = base64.b64decode(creds_b64)
         tf = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
         tf.write(raw); tf.flush(); tf.close()
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tf.name
@@ -95,7 +114,6 @@ st.title("⭐ ARAM 픽 최적화 (샘플 CSV 기반 시연)")
 st.sidebar.header("데이터")
 mode = st.sidebar.radio("CSV", ["기본 경로", "파일 업로드"], horizontal=True)
 df = None
-
 if mode == "기본 경로":
     st.sidebar.caption(f"기본 경로 후보: {DEFAULT_CSV}")
     if DEFAULT_CSV.exists():
@@ -133,29 +151,42 @@ all_champs = list_all_champs(models)
 # 3) 스크린샷 감지 (옵션)
 # ----------------------------
 st.sidebar.subheader("스크린샷 감지 (옵션)")
-use_vertex = st.sidebar.checkbox("사용", value=False)
+
+# 섹션 선택: 사용 안 함 / SCENARIO1 / SCENARIO2
+section_choice = st.sidebar.selectbox(
+    "Vertex 엔드포인트",
+    ["사용 안 함", "SCENARIO1", "SCENARIO2"],
+    index=0
+)
+
+use_vertex = section_choice != "사용 안 함"
 threshold = st.sidebar.slider("신뢰도(%)", 50, 95, 50, 1)
 
+# 캐시: 파라미터가 바뀌면 다른 리소스로 간주되어 재초기화
 @st.cache_resource
-def get_endpoint():
-    if not (PROJECT_ID and ENDPOINT_ID):
+def get_endpoint_cached(project, region, endpoint_id, creds_b64):
+    if not (project and endpoint_id):
         return None
-    _ensure_adc_from_b64()
-    return init_vertex(PROJECT_ID, REGION, ENDPOINT_ID)
+    _ensure_adc_from_b64(creds_b64)
+    return init_vertex(project, region, endpoint_id)
 
 detected_current, detected_bench = [], []
 uploaded = st.file_uploader("픽 화면 스크린샷 (png/jpg)", type=["png","jpg","jpeg"]) if use_vertex else None
 
 if uploaded and use_vertex:
-    endpoint = get_endpoint()
-    if endpoint:
+    PROJECT_ID, REGION, ENDPOINT_ID, CREDS_B64 = get_vertex_secrets(section_choice)
+    endpoint = get_endpoint_cached(PROJECT_ID, REGION, ENDPOINT_ID, CREDS_B64)
+
+    if endpoint is None:
+        st.warning("Secrets에서 엔드포인트 설정을 찾지 못했습니다. (해당 섹션의 PROJECT_ID/ENDPOINT_ID/자격증명 Base64 확인)")
+    else:
         image = Image.open(uploaded).convert("RGB")
         st.image(image, caption="업로드 이미지", use_container_width=True)
         with st.spinner("감지 중..."):
             cur, bench, overlay = predict_image(endpoint, image, threshold=threshold)
         st.image(overlay, caption="탐지 영역", use_container_width=True)
         detected_current = _map_and_filter_detected(cur, all_champs)[:5]
-        detected_bench = _map_and_filter_detected(bench, all_champs)[:10]
+        detected_bench   = _map_and_filter_detected(bench, all_champs)[:10]
 
 # ----------------------------
 # 4) 우리 팀 5명 선택
