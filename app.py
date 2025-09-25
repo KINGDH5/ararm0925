@@ -1,10 +1,5 @@
-# app.py — GitHub/Streamlit 배포용 (절대경로 제거, Secrets 지원, 엔드포인트 캐싱)
-
-import os
-import base64
-import tempfile
+import os, base64, tempfile
 from pathlib import Path
-
 import streamlit as st
 import pandas as pd
 from PIL import Image
@@ -12,24 +7,25 @@ from PIL import Image
 from ml import read_csv_safe, train_models, get_team_winrate, list_all_champs
 from image import init_vertex, predict_image
 
-
 # ----------------------------
-# 경로/설정 (절대경로 제거)
+# 경로/설정
 # ----------------------------
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_CSV = BASE_DIR / "data" / "renamed_data.csv"   # ← 레포 내 data/ 폴더 사용
+_CSV_CANDIDATES = [
+    BASE_DIR / "data" / "renamed_data.csv",
+    BASE_DIR / "renamed_data.csv",
+    BASE_DIR / "data" / "renamed_data_sample.csv",
+    BASE_DIR / "renamed_data_sample.csv",
+]
+DEFAULT_CSV = next((p for p in _CSV_CANDIDATES if p.exists()), _CSV_CANDIDATES[0])
 
-# ---- Vertex 설정: Streamlit Secrets → 없으면 기능 비활성 ----
 PROJECT_ID  = st.secrets.get("PROJECT_ID")
 REGION      = st.secrets.get("REGION", "us-central1")
 ENDPOINT_ID = st.secrets.get("ENDPOINT_ID")
-CREDS_B64   = st.secrets.get("GOOGLE_APPLICATION_CREDENTIALS_B64")  # 선택
-
+CREDS_B64   = st.secrets.get("GOOGLE_APPLICATION_CREDENTIALS_B64")
 
 def _ensure_adc_from_b64():
-    """secrets에 서비스계정 JSON(Base64)이 있으면 임시파일로 복원해 ADC 설정."""
-    if not CREDS_B64:
-        return None
+    if not CREDS_B64: return None
     try:
         raw = base64.b64decode(CREDS_B64)
         tf = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
@@ -40,8 +36,7 @@ def _ensure_adc_from_b64():
         st.warning(f"크리덴셜 복원 실패: {e}")
         return None
 
-
-# === EN->KO 챔피언 매핑 ===
+# === EN->KO 챔피언 매핑 (완성본) ===
 EN2KO = {
     "Aatrox":"아트록스","Ahri":"아리","Akali":"아칼리","Akshan":"아크샨","Alistar":"알리스타",
     "Amumu":"아무무","Anivia":"애니비아","Annie":"애니","Aphelios":"아펠리오스","Ashe":"애쉬",
@@ -91,9 +86,8 @@ def _map_and_filter_detected(names_list, options):
             out.append(k)
     return out
 
-
 st.set_page_config(page_title="ARAM 픽 최적화", layout="wide")
-st.title("⭐ ARAM 픽 최적화 (같은 모델 값, 파일만 3개)")
+st.title("⭐ ARAM 픽 최적화 (샘플 CSV 기반 시연)")
 
 # ----------------------------
 # 1) CSV 선택
@@ -103,11 +97,11 @@ mode = st.sidebar.radio("CSV", ["기본 경로", "파일 업로드"], horizontal
 df = None
 
 if mode == "기본 경로":
-    st.sidebar.caption(f"기본 경로: {DEFAULT_CSV}")
+    st.sidebar.caption(f"기본 경로 후보: {DEFAULT_CSV}")
     if DEFAULT_CSV.exists():
         df = read_csv_safe(str(DEFAULT_CSV))
     else:
-        st.sidebar.warning("data/renamed_data.csv 가 레포에 없습니다.")
+        st.sidebar.warning("샘플 CSV가 없습니다.")
 else:
     up = st.sidebar.file_uploader("CSV 업로드", type=["csv"])
     if up:
@@ -136,7 +130,7 @@ models = st.session_state.models
 all_champs = list_all_champs(models)
 
 # ----------------------------
-# 3) (선택) 스크린샷 감지
+# 3) 스크린샷 감지 (옵션)
 # ----------------------------
 st.sidebar.subheader("스크린샷 감지 (옵션)")
 use_vertex = st.sidebar.checkbox("사용", value=False)
@@ -144,25 +138,17 @@ threshold = st.sidebar.slider("신뢰도(%)", 50, 95, 50, 1)
 
 @st.cache_resource
 def get_endpoint():
-    """Vertex 엔드포인트 초기화(옵션). secrets 없으면 None."""
     if not (PROJECT_ID and ENDPOINT_ID):
         return None
     _ensure_adc_from_b64()
-    try:
-        # 새 시그니처(3개 인자)
-        return init_vertex(PROJECT_ID, REGION, ENDPOINT_ID)
-    except TypeError:
-        # 예전 시그니처(4개 인자) 호환
-        return init_vertex(PROJECT_ID, REGION, ENDPOINT_ID, None)
+    return init_vertex(PROJECT_ID, REGION, ENDPOINT_ID)
 
 detected_current, detected_bench = [], []
 uploaded = st.file_uploader("픽 화면 스크린샷 (png/jpg)", type=["png","jpg","jpeg"]) if use_vertex else None
 
 if uploaded and use_vertex:
     endpoint = get_endpoint()
-    if endpoint is None:
-        st.warning("Streamlit Secrets에 PROJECT_ID/ENDPOINT_ID가 없어 감지 기능이 비활성화되었습니다.")
-    else:
+    if endpoint:
         image = Image.open(uploaded).convert("RGB")
         st.image(image, caption="업로드 이미지", use_container_width=True)
         with st.spinner("감지 중..."):
@@ -194,9 +180,7 @@ pool = st.multiselect(
 )
 
 target = st.selectbox("교체할 내 챔피언", options=my_team)
-rows = []
-best = None
-best_inc = 0.0
+rows, best, best_inc = [], None, 0.0
 
 for cand in pool:
     new_team = [cand if x == target else x for x in my_team]
