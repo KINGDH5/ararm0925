@@ -1,11 +1,6 @@
-# pages/01_시나리오1.py
-import os, runpy, streamlit as st
+import runpy
+from pathlib import Path
 
-# 멀티페이지에서 set_page_config 중복 경고 피하고 싶으면 환경변수 하나 심어줌
-os.environ["IS_MULTIPAGE"] = "1"
-
-# 올바른 코드 (새 경로)
-SCRIPT = r"C:\Users\권도혁\Desktop\시나리오1,2\app.py"
-
-# 실행
-runpy.run_path(SCRIPT, run_name="__main__")
+# 프로젝트 루트의 app.py 실행
+SCRIPT = Path(__file__).resolve().parents[1] / "app.py"
+runpy.run_path(str(SCRIPT), run_name="__main__")
