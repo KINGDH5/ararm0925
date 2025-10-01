@@ -1,67 +1,93 @@
-# rune_champion.py — GitHub/Streamlit 배포용
+# rune_champion.py — Streamlit Cloud 안전 실행판
 # -*- coding: utf-8 -*-
 import os, io, base64, json
 from pathlib import Path
 from PIL import Image, ImageEnhance, ImageDraw
-from google.cloud import vision, aiplatform
-from google.oauth2 import service_account
 import pandas as pd
 
-# ===============================
-# BASE_DIR: 현재 파일 기준
-# ===============================
+# ─────────────────────────────────────────────
+# Streamlit secrets 지원
+# ─────────────────────────────────────────────
+try:
+    import streamlit as st
+    _SECRETS = dict(st.secrets) if hasattr(st, "secrets") else {}
+except Exception:
+    _SECRETS = {}
+
+def _get_secret(key, default=None):
+    return os.environ.get(key) or _SECRETS.get(key, default)
+
+# ─────────────────────────────────────────────
+# Google SDK 임포트 (없어도 앱 죽지 않게)
+# ─────────────────────────────────────────────
+try:
+    from google.cloud import vision, aiplatform
+    from google.oauth2 import service_account
+    _GOOGLE_OK = True
+except Exception:
+    _GOOGLE_OK = False
+    vision = aiplatform = service_account = None
+
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
 
-# ===============================
-# GCP 인증 (Secrets/ADC 사용)
-# ===============================
-def _load_creds_from_env_or_b64(b64_str: str | None = None, file_hint: str | None = None):
-    """우선순위: (1) ADC (2) 파일 (3) Base64"""
-    # 1) 환경변수 GOOGLE_APPLICATION_CREDENTIALS
-    cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if cred_path and Path(cred_path).exists():
-        return service_account.Credentials.from_service_account_file(cred_path)
+# ─────────────────────────────────────────────
+# GCP 인증 로더
+# ─────────────────────────────────────────────
+def _load_creds_from_env_or_b64(b64_key: str = None, file_hint: str = None):
+    if not _GOOGLE_OK:
+        return None
+    try:
+        cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if cred_path and Path(cred_path).exists():
+            return service_account.Credentials.from_service_account_file(cred_path)
+        if file_hint and Path(file_hint).exists():
+            return service_account.Credentials.from_service_account_file(file_hint)
+        if b64_key:
+            b64_val = _get_secret(b64_key)
+            if b64_val:
+                data = json.loads(base64.b64decode(b64_val))
+                return service_account.Credentials.from_service_account_info(data)
+    except Exception:
+        pass
+    return None
 
-    # 2) 특정 파일 힌트 (로컬 개발시만)
-    if file_hint and Path(file_hint).exists():
-        return service_account.Credentials.from_service_account_file(file_hint)
+# ─────────────────────────────────────────────
+# Vision / Vertex 안전 초기화
+# ─────────────────────────────────────────────
+VISION_CRED = _load_creds_from_env_or_b64("VISION_CRED_B64")
+if _GOOGLE_OK:
+    try:
+        vision_client = vision.ImageAnnotatorClient(credentials=VISION_CRED)
+    except Exception:
+        vision_client = None
+else:
+    vision_client = None
 
-    # 3) Base64 (Streamlit secrets["..._B64"])
-    if b64_str:
-        try:
-            data = json.loads(base64.b64decode(b64_str))
-            return service_account.Credentials.from_service_account_info(data)
-        except Exception:
-            pass
+RUNE_PROJECT_ID  = _get_secret("RUNE_PROJECT_ID",  "your-project-id")
+RUNE_LOCATION    = _get_secret("RUNE_LOCATION",    "us-central1")
+RUNE_ENDPOINT_ID = _get_secret("RUNE_ENDPOINT_ID", "0000000000000000000")
+RUNE_CRED        = _load_creds_from_env_or_b64("RUNE_CRED_B64")
 
-    return None  # ADC 기본
+if _GOOGLE_OK:
+    try:
+        aiplatform.init(project=RUNE_PROJECT_ID, location=RUNE_LOCATION, credentials=RUNE_CRED)
+        RUNE_endpoint = aiplatform.Endpoint(RUNE_ENDPOINT_ID)
+    except Exception:
+        RUNE_endpoint = None
+else:
+    RUNE_endpoint = None
 
-
-# Vision API 클라이언트
-vision_creds = _load_creds_from_env_or_b64(os.environ.get("VISION_CRED_B64"))
-vision_client = vision.ImageAnnotatorClient(credentials=vision_creds)
-
-# Vertex AI Endpoint
-RUNE_PROJECT_ID  = os.environ.get("RUNE_PROJECT_ID", "gen-lang-client-0207006785")
-RUNE_LOCATION    = os.environ.get("RUNE_LOCATION", "us-central1")
-RUNE_ENDPOINT_ID = os.environ.get("RUNE_ENDPOINT_ID", "3362037177390202880")
-rune_creds = _load_creds_from_env_or_b64(os.environ.get("RUNE_CRED_B64"))
-aiplatform.init(project=RUNE_PROJECT_ID, location=RUNE_LOCATION, credentials=rune_creds)
-RUNE_endpoint = aiplatform.Endpoint(RUNE_ENDPOINT_ID)
-
-# ===============================
+# ─────────────────────────────────────────────
 # 기준 해상도 / 스케일
-# ===============================
+# ─────────────────────────────────────────────
 BASE_W, BASE_H = 1920, 1080
 def _scale_box(box, img_w, img_h):
     x1, y1, x2, y2 = box
     sx, sy = img_w / BASE_W, img_h / BASE_H
     return (int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy))
 
-# ===============================
-# ROI 좌표
-# ===============================
+# 챔피언/룬 박스 좌표
 champion_name_regions = [
     (243, 407, 487, 433), (539, 407, 783, 433), (834, 407, 1080, 433),
     (1128, 407, 1375, 433), (1425, 407, 1671, 433), (243, 928, 487, 958),
@@ -75,9 +101,7 @@ RUNE_boxes = [
     (1440, 971, 1466, 999)
 ]
 
-# ===============================
-# 룬 이름 매핑 / 역할군 테이블
-# ===============================
+# 룬 이름 매핑
 RUNE_NAME_MAP = {
     "Electrocute": "감전", "Predator": "포식자", "DarkHarvest": "어둠의 수확",
     "HailOfBlades": "칼날비", "GlacialAugment": "빙결 강화",
@@ -89,7 +113,7 @@ RUNE_NAME_MAP = {
     "ArcaneComet": "신비로운 유성", "PhaseRush": "난입",
 }
 
-# CSV 로드 (레포 안에 두는게 안전)
+# CSV 로드
 champion_df = pd.read_csv(BASE_DIR / "lol_champions.csv", encoding="utf-8")
 champions_list = champion_df["name"].tolist()
 role_df = pd.read_csv(BASE_DIR / "champion_rune_roles.csv", encoding="utf-8")
@@ -100,10 +124,12 @@ def get_role(champ_name, rune_name):
         return row.iloc[0][rune_name]
     return "정보 없음"
 
-# ===============================
-# OCR
-# ===============================
+# ─────────────────────────────────────────────
+# OCR 함수
+# ─────────────────────────────────────────────
 def ocr_champion_region(image_path, region):
+    if vision_client is None:
+        return ""
     with Image.open(image_path) as img:
         w, h = img.size
         r = _scale_box(region, w, h)
@@ -128,10 +154,12 @@ def extract_champions(image_path):
         out.append(matched[0] if matched else text)
     return out
 
-# ===============================
-# 룬 예측
-# ===============================
+# ─────────────────────────────────────────────
+# 룬 예측 (Vertex)
+# ─────────────────────────────────────────────
 def predict_RUNE(endpoint, image_bytes, threshold=35.0):
+    if endpoint is None:
+        return "null", 0.0
     inst = {"content": base64.b64encode(image_bytes).decode("utf-8")}
     try:
         res = endpoint.predict(instances=[inst])
@@ -162,9 +190,9 @@ def crop_and_predict_RUNEs(image_path):
             results.append(predict_RUNE(RUNE_endpoint, buf.getvalue()))
     return results
 
-# ===============================
+# ─────────────────────────────────────────────
 # 팀/룬/역할군 추출
-# ===============================
+# ─────────────────────────────────────────────
 def extract_champions_and_runes(image_path, my_champion):
     champions = extract_champions(image_path)
     runes = crop_and_predict_RUNEs(image_path)
@@ -182,9 +210,9 @@ def extract_champions_and_runes(image_path, my_champion):
     enemy_team = [(c, r[0], get_role(c, r[0])) for c, r in zip(enemy_team_champs, enemy_team_runes)]
     return my_team, enemy_team
 
-# ===============================
+# ─────────────────────────────────────────────
 # ROI 디버그
-# ===============================
+# ─────────────────────────────────────────────
 def draw_rois(image_path, save_path=None):
     img = Image.open(image_path).convert("RGB")
     w, h = img.size; dr = ImageDraw.Draw(img)
